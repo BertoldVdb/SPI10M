@@ -79,6 +79,8 @@ Connecting to a NIC:
 * TX-: Pin 6 (Usually orange wire)
 
 You need to know where the MOSI pin is on the board you are using. The following picture shows where to connect the wires on a Pi Zero:
+
+
 ![Pi Zero Wiring Example](wiring/pizero.png)
 
 ### Kernel source installation on Raspberry Pi
