@@ -1,0 +1,22 @@
+# Enable the SPI ethernet port
+dtoverlay=spi10m
+
+# Disable DRAM calibration. This sometimes causes lost packets due to gaps in the SPI stream
+disable_pvt=1
+
+# Required to set core_freq separately. 400MHz allows getting 20MHz SPI clock.
+# Over_voltage 8 is much more than what is required to make this stable but I usually start 
+# with that when developing to avoid strange issues. Then I lower it later. I left the core
+# voltage at 1.4V on some devices for years and so far they didn't break yet... YMMV.
+
+avoid_pwm_pll=1
+core_freq=400
+over_voltage=8
+
+# The core clock must be stable, or the SPI frequency will change
+force_turbo=1
+
+# Overclock the ARM a bit. Not needed, but if you increased the core voltage to be able to
+# increase the core_freq, you may as wel do this and make the device a bit faster.
+arm_freq=1000
+

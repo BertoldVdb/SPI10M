@@ -1,0 +1,39 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2708";
+
+	fragment@0 {
+		target = <&spi0>;
+		__overlay__ {
+			/* Needed to avoid dtc warning */
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			status = "okay";
+
+			spidev@0{
+				status = "disabled";
+			};
+
+			eth1: spi10m@0{
+				compatible = "bertold,spi10m";
+				reg = <0>;
+				spi-max-frequency = <20000000>;
+				status = "okay";
+			};
+		};
+	};
+
+	fragment@1 {
+		target = <&gpio>;
+		__overlay__ {
+			/* We only enable MOSI as output, leaving the other GPIO free */
+			spi0_pins: spi0_pins {
+                                brcm,pins = <10>;
+                                brcm,function = <4>; /* alt0 */
+			};
+		};
+	};
+};
