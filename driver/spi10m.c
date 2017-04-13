@@ -23,6 +23,7 @@
 #include <linux/ethtool.h>
 #include <linux/hrtimer.h>
 #include <linux/crc32.h>
+#include <linux/if_vlan.h>
 
 /*
  * The normal preamble is 8 bytes long, but if you use a capacitor to drive
@@ -32,18 +33,17 @@ static unsigned int spi10m_preamble_length = 8;
 module_param(spi10m_preamble_length, int, 0444);
 MODULE_PARM_DESC(spi10m_preamble_length, "Number of preamble bytes");
 
-#define SPI10M_MIN_LEN 60
-#define SPI10M_TXBUFFER_MAX_PACKET 1500
+#define SPI10M_FOOTER_LEN (1 + 12)
 
 struct spi10m_dev {
 	struct net_device *netdev;
 	struct spi_device *spi;
 
-	uint8_t buf[SPI10M_TXBUFFER_MAX_PACKET + 4];
-
 	unsigned long tx_buffer_size;
+	unsigned long tx_buffer_max_packet;
 	uint16_t *tx_buffer;
 	dma_addr_t tx_buffer_dma;
+	struct mutex tx_buffer_mutex;
 
 	unsigned long spi_speed;
 
@@ -60,24 +60,6 @@ struct spi10m_dev {
 	spinlock_t tx_skb_lock;
 
 	uint16_t manchester_table[256];
-};
-
-static void spi10m_get_ethtool_stats(struct net_device *dev,
-			struct ethtool_stats *stats, uint64_t *data)
-{
-	struct spi10m_dev *priv = netdev_priv(dev);
-	unsigned long flags;
-
-	memset(data, 0, 12 * sizeof(uint64_t));
-
-	spin_lock_irqsave(&priv->tx_skb_lock, flags);
-	data[0] = le64_to_cpu(priv->tx_packets);
-	spin_unlock_irqrestore(&priv->tx_skb_lock, flags);
-}
-
-
-static const struct ethtool_ops spi10m_ethtool_ops = {
-	.get_ethtool_stats = spi10m_get_ethtool_stats
 };
 
 static int spi10m_set_mac_address(struct net_device *dev, void *addr)
@@ -145,9 +127,80 @@ static struct rtnl_link_stats64 *spi10m_get_stats64
 	return stats;
 }
 
+static bool spi10m_alloc_dma_buffer(struct spi10m_dev *dev,
+				    unsigned long desired_max_packet)
+{
+	bool ret = false;
+	unsigned int i;
+
+	unsigned long new_buffer_size = 2 * (spi10m_preamble_length +
+					     desired_max_packet +
+					     ETH_FCS_LEN + SPI10M_FOOTER_LEN);
+	dma_addr_t new_buffer_dma;
+	uint16_t *new_buffer;
+
+	mutex_lock(&dev->tx_buffer_mutex);
+
+	new_buffer = dma_alloc_coherent(&dev->spi->dev,
+					new_buffer_size,
+					&new_buffer_dma,
+					GFP_KERNEL);
+
+	if (new_buffer) {
+		/* Deallocate current buffer, if there is one */
+		if (dev->tx_buffer) {
+			dma_free_coherent(&dev->spi->dev,
+					  dev->tx_buffer_size,
+					  dev->tx_buffer,
+					  dev->tx_buffer_dma);
+		}
+
+		dev->tx_buffer = new_buffer;
+		dev->tx_buffer_dma = new_buffer_dma;
+		dev->tx_buffer_size = new_buffer_size;
+		dev->tx_buffer_max_packet = desired_max_packet;
+
+		/* Add the preamble and SFD */
+		for (i = 0; i < (spi10m_preamble_length - 1); i++)
+			new_buffer[i] =
+				be16_to_cpu(dev->manchester_table[0x55]);
+
+		new_buffer[spi10m_preamble_length - 1] =
+				be16_to_cpu(dev->manchester_table[0xD5]);
+
+		ret = true;
+	}
+
+	mutex_unlock(&dev->tx_buffer_mutex);
+
+	return ret;
+}
+
+static int spi10m_change_mtu(struct net_device *dev, int new_mtu)
+{
+	struct spi10m_dev *priv = netdev_priv(dev);
+
+#if IS_ENABLED(CONFIG_VLAN_8021Q)
+	int vlan_bytes = VLAN_HLEN;
+#else
+	int vlan_bytes = 0;
+#endif
+
+	unsigned long desired_max_packet = vlan_bytes + ETH_HLEN +
+					   ETH_FCS_LEN + new_mtu;
+
+	if (spi10m_alloc_dma_buffer(priv, desired_max_packet)) {
+		dev->mtu = new_mtu;
+
+		return 0;
+	}
+
+	return -ENOMEM;
+}
 
 static const struct net_device_ops spi10m_netdev_ops = {
 	.ndo_start_xmit		= spi10m_send_packet,
+	.ndo_change_mtu		= spi10m_change_mtu,
 	.ndo_set_mac_address	= spi10m_set_mac_address,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_get_stats64	= spi10m_get_stats64
@@ -162,11 +215,12 @@ static void spi10m_tx_work_handler(struct work_struct *work)
 	unsigned long flags;
 
 	struct sk_buff *skb;
-
 	unsigned int len;
+
 	uint16_t *tx_packet = priv->tx_buffer;
 
 	uint32_t crc_add;
+
 	uint16_t tmp;
 
 	struct spi_message message = {};
@@ -188,44 +242,56 @@ static void spi10m_tx_work_handler(struct work_struct *work)
 	} else{
 		len = skb->len;
 
-		if (len < SPI10M_TXBUFFER_MAX_PACKET) {
-			/* Copy packet to local buffer */
-			skb_copy_bits(skb, 0, priv->buf, len);
-			dev_kfree_skb(skb);
+		/* Lock buffer mutex */
+		mutex_lock(&priv->tx_buffer_mutex);
 
+		if (len <= priv->tx_buffer_max_packet) {
 			/* Skip preamble */
 			tx_packet += spi10m_preamble_length;
 
-			/* Add padding if needed */
-			if (len < SPI10M_MIN_LEN) {
-				memset(priv->buf + len,
-				       0,
-				       SPI10M_MIN_LEN - len);
-				len = SPI10M_MIN_LEN;
-			}
-
-			/* Add checksum */
-			crc_add = ~le32_to_cpu(ether_crc_le(len, priv->buf));
-			memcpy(priv->buf + len, &crc_add, 4);
-			len += 4;
-
-			/* Convert the packet to manchester encoding */
+			/* Manchester encoder packet */
 			for (i = 0; i < len; i++) {
-				tmp = priv->manchester_table[priv->buf[i]];
+				tmp = priv->manchester_table[skb->data[i]];
 				tx_packet[i] = be16_to_cpu(tmp);
 			}
-			tx_packet += len;
+
+			/* Calculate CRC */
+			crc_add = ether_crc_le(len, skb->data);
+
+			/* Add padding if needed */
+			if (len < ETH_ZLEN) {
+				for (i = len; i < ETH_ZLEN; i++) {
+					tmp = priv->manchester_table[0];
+					tx_packet[len + i] = be16_to_cpu(tmp);
+				}
+
+				/* TODO: This is very likely wrong... */
+				crc_add = crc32_le_combine(crc_add, 0,
+							   ETH_ZLEN - len);
+
+				len = ETH_ZLEN;
+			}
+
+			/* Manchester encode CRC */
+			crc_add = ~le32_to_cpu(crc_add);
+			for (i = 0; i < ETH_FCS_LEN; i++) {
+				tmp = priv->manchester_table
+						[((uint8_t *)&crc_add)[i]];
+				tx_packet[len + i] = be16_to_cpu(tmp);
+			}
+			len += ETH_FCS_LEN;
 
 			/* Encode TP_IDL */
 			if (tmp & 1)
-				tx_packet[0] = be16_to_cpu(0xFC00); /* 300ns */
+				tx_packet[len] = be16_to_cpu(0xFC00);
 			else
-				tx_packet[0] = be16_to_cpu(0xFE00); /* 350ns */
-			tx_packet++;
+				tx_packet[len] = be16_to_cpu(0xFE00);
+			len++;
 
 			/* Add interframe gap */
 			for (i = 0; i < 12; i++)
-				tx_packet[i] = 0;
+				tx_packet[len + i] = 0;
+			len += 12;
 
 			/* Send it over SPI */
 			spi_message_init(&message);
@@ -235,8 +301,7 @@ static void spi10m_tx_work_handler(struct work_struct *work)
 			transfer.rx_buf = NULL;
 			transfer.rx_dma = 0;
 
-			transfer.len = 2 * (spi10m_preamble_length + len +
-					    12 + 1);
+			transfer.len = 2 * (spi10m_preamble_length + len);
 
 			spi_message_add_tail(&transfer, &message);
 
@@ -245,14 +310,17 @@ static void spi10m_tx_work_handler(struct work_struct *work)
 			transfer.speed_hz = priv->spi_speed;
 
 			spi_sync(priv->spi, &message);
-		} else
-			dev_kfree_skb(skb);
+		}
 
 		spin_lock_irqsave(&priv->tx_skb_lock, flags);
 		priv->tx_skb = NULL;
 		priv->tx_packets++;
-		priv->tx_bytes += len;
+		priv->tx_bytes += skb->len;
 		spin_unlock_irqrestore(&priv->tx_skb_lock, flags);
+
+		dev_kfree_skb(skb);
+
+		mutex_unlock(&priv->tx_buffer_mutex);
 
 		netif_wake_queue(priv->netdev);
 	}
@@ -299,37 +367,25 @@ static int spi10m_probe(struct spi_device *spi)
 		spi10m_preamble_length = 1;
 
 	spin_lock_init(&dev->tx_skb_lock);
-
-	dev->tx_buffer_size = 2 * (spi10m_preamble_length +
-				   SPI10M_TXBUFFER_MAX_PACKET + 4 + 1 + 12);
-	dev->tx_buffer = dma_alloc_coherent(&spi->dev,
-					    dev->tx_buffer_size,
-					    &dev->tx_buffer_dma,
-					    GFP_KERNEL);
-	if (!dev->tx_buffer) {
-		ret = -ENOMEM;
-		dev_err(&spi->dev, "TX Buffer allocation failed\n");
-		goto err_allocbuf;
-	}
+	mutex_init(&dev->tx_buffer_mutex);
 
 	/* Initialize table */
 	for (i = 0; i < 256; i++)
 		dev->manchester_table[i] = spi10m_calculate_manchester(i);
 
-	/* Add the preamble and SFD */
-	for (i = 0; i < (spi10m_preamble_length - 1); i++)
-		dev->tx_buffer[i] = be16_to_cpu(dev->manchester_table[0x55]);
+	ret = spi10m_change_mtu(netdev, netdev->mtu);
+	if (ret) {
+		dev_err(&spi->dev, "TX Buffer allocation failed\n");
 
-	dev->tx_buffer[spi10m_preamble_length - 1] =
-				be16_to_cpu(dev->manchester_table[0xD5]);
+		goto err_allocbuf;
+	}
 
 	/* This is a transmit only adapter so random is fine */
 	eth_hw_addr_random(netdev);
 
 	netdev->if_port = IF_PORT_10BASET;
 	netdev->netdev_ops = &spi10m_netdev_ops;
-	netdev->watchdog_timeo = 10 * HZ; /* 10 seconds */
-	netdev->ethtool_ops = &spi10m_ethtool_ops;
+	netdev->watchdog_timeo = HZ;
 
 	/* Setup SPI to 20MHz to create a 10MHz manchester signal */
 	dev->spi_speed = 20000000;
@@ -345,7 +401,7 @@ static int spi10m_probe(struct spi_device *spi)
 	}
 
 	dev->nlp_period = ktime_set(0, 16000000); /* 16ms */
-	hrtimer_init(&dev->nlp_timer, CLOCK_REALTIME, HRTIMER_MODE_REL);
+	hrtimer_init(&dev->nlp_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	dev->nlp_timer.function = spi10m_send_nlp;
 	dev->nlp_byte[0] = 0x3;
 	hrtimer_start(&dev->nlp_timer, dev->nlp_period, HRTIMER_MODE_REL);
