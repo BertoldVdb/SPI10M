@@ -33,6 +33,14 @@ static unsigned int spi10m_preamble_length = 8;
 module_param(spi10m_preamble_length, int, 0444);
 MODULE_PARM_DESC(spi10m_preamble_length, "Number of preamble bytes");
 
+/*
+ * When this flag is set the driver will read back what it sent over the bus.
+ * This can be used for monitoring if the transmitter is actually working.
+ */
+static bool spi10m_spi_readback;
+module_param(spi10m_spi_readback, bool, 0444);
+MODULE_PARM_DESC(spi10m_spi_readback, "Use SPI readback");
+
 #define SPI10M_FOOTER_LEN (1 + 12)
 
 struct spi10m_dev {
@@ -45,10 +53,16 @@ struct spi10m_dev {
 	dma_addr_t tx_buffer_dma;
 	struct mutex tx_buffer_mutex;
 
+	unsigned long check_buffer_size;
+	uint16_t *check_buffer;
+	dma_addr_t check_buffer_dma;
+
 	unsigned long spi_speed;
 
 	uint64_t tx_packets;
 	uint64_t tx_bytes;
+	uint64_t tx_errors;
+	uint64_t tx_nlp_sent;
 
 	struct hrtimer nlp_timer;
 	ktime_t nlp_period;
@@ -70,6 +84,7 @@ static int spi10m_set_mac_address(struct net_device *dev, void *addr)
 		return -EADDRNOTAVAIL;
 
 	memcpy(dev->dev_addr, address->sa_data, dev->addr_len);
+
 	return 0;
 }
 
@@ -122,12 +137,37 @@ static struct rtnl_link_stats64 *spi10m_get_stats64
 	spin_lock_irqsave(&priv->tx_skb_lock, flags);
 	stats->tx_packets = priv->tx_packets;
 	stats->tx_bytes = priv->tx_bytes;
+	stats->tx_errors = priv->tx_errors;
+
+	/* Put the number of link pulse transmissions in this field */
+	stats->collisions = priv->tx_nlp_sent;
 	spin_unlock_irqrestore(&priv->tx_skb_lock, flags);
 
 	return stats;
 }
 
-static bool spi10m_alloc_dma_buffer(struct spi10m_dev *dev,
+static void spi10m_free_dma_buffer(struct spi10m_dev *dev, int buffer)
+{
+	if (buffer == 0 && dev->tx_buffer) {
+		dma_free_coherent(&dev->spi->dev,
+			  dev->tx_buffer_size,
+			  dev->tx_buffer,
+			  dev->tx_buffer_dma);
+		dev->tx_buffer = NULL;
+		dev->tx_buffer_dma = 0;
+	}
+
+	if (buffer == 1 && dev->check_buffer) {
+		dma_free_coherent(&dev->spi->dev,
+			  dev->check_buffer_size,
+			  dev->check_buffer,
+			  dev->check_buffer_dma);
+		dev->check_buffer = NULL;
+		dev->check_buffer_dma = 0;
+	}
+}
+
+static bool spi10m_alloc_ptx_buffer(struct spi10m_dev *dev,
 				    unsigned long desired_max_packet)
 {
 	bool ret = false;
@@ -136,39 +176,51 @@ static bool spi10m_alloc_dma_buffer(struct spi10m_dev *dev,
 	unsigned long new_buffer_size = 2 * (spi10m_preamble_length +
 					     desired_max_packet +
 					     ETH_FCS_LEN + SPI10M_FOOTER_LEN);
-	dma_addr_t new_buffer_dma;
-	uint16_t *new_buffer;
+	dma_addr_t new_buffer_dma_tx;
+	uint16_t *new_buffer_tx;
+
+	if (dev->tx_buffer && (new_buffer_size == dev->tx_buffer_size))
+		return true;
 
 	mutex_lock(&dev->tx_buffer_mutex);
 
-	new_buffer = dma_alloc_coherent(&dev->spi->dev,
-					new_buffer_size,
-					&new_buffer_dma,
-					GFP_KERNEL);
+	new_buffer_tx = dma_alloc_coherent(&dev->spi->dev,
+					   new_buffer_size,
+					   &new_buffer_dma_tx,
+					   GFP_KERNEL);
 
-	if (new_buffer) {
+	if (new_buffer_tx) {
 		/* Deallocate current buffer, if there is one */
-		if (dev->tx_buffer) {
-			dma_free_coherent(&dev->spi->dev,
-					  dev->tx_buffer_size,
-					  dev->tx_buffer,
-					  dev->tx_buffer_dma);
-		}
+		spi10m_free_dma_buffer(dev, 0);
 
-		dev->tx_buffer = new_buffer;
-		dev->tx_buffer_dma = new_buffer_dma;
+		dev->tx_buffer = new_buffer_tx;
+		dev->tx_buffer_dma = new_buffer_dma_tx;
 		dev->tx_buffer_size = new_buffer_size;
 		dev->tx_buffer_max_packet = desired_max_packet;
 
 		/* Add the preamble and SFD */
 		for (i = 0; i < (spi10m_preamble_length - 1); i++)
-			new_buffer[i] =
+			new_buffer_tx[i] =
 				be16_to_cpu(dev->manchester_table[0x55]);
 
-		new_buffer[spi10m_preamble_length - 1] =
+		new_buffer_tx[spi10m_preamble_length - 1] =
 				be16_to_cpu(dev->manchester_table[0xD5]);
 
 		ret = true;
+	}
+
+	if (spi10m_spi_readback) {
+		spi10m_free_dma_buffer(dev, 1);
+
+		dev->check_buffer = dma_alloc_coherent(&dev->spi->dev,
+						       new_buffer_size,
+						       &dev->check_buffer_dma,
+						       GFP_KERNEL);
+		dev->check_buffer_size = new_buffer_size;
+
+		if (!dev->check_buffer)
+			dev_warn(&dev->spi->dev,
+				"Could not allocate verification buffer");
 	}
 
 	mutex_unlock(&dev->tx_buffer_mutex);
@@ -189,7 +241,7 @@ static int spi10m_change_mtu(struct net_device *dev, int new_mtu)
 	unsigned long desired_max_packet = vlan_bytes + ETH_HLEN +
 					   ETH_FCS_LEN + new_mtu;
 
-	if (spi10m_alloc_dma_buffer(priv, desired_max_packet)) {
+	if (spi10m_alloc_ptx_buffer(priv, desired_max_packet)) {
 		dev->mtu = new_mtu;
 
 		return 0;
@@ -210,6 +262,8 @@ static void spi10m_tx_work_handler(struct work_struct *work)
 {
 	struct spi10m_dev *priv = container_of(work, struct spi10m_dev,
 						tx_work);
+
+	bool tx_ok = true;
 
 	unsigned int i;
 	unsigned long flags;
@@ -235,10 +289,14 @@ static void spi10m_tx_work_handler(struct work_struct *work)
 		spi_message_init(&message);
 		transfer.tx_buf = priv->nlp_byte;
 		transfer.len = 1;
-		spi_message_add_tail(&transfer, &message);
 		transfer.speed_hz = priv->spi_speed;
+		spi_message_add_tail(&transfer, &message);
 
 		spi_sync(priv->spi, &message);
+
+		spin_lock_irqsave(&priv->tx_skb_lock, flags);
+		priv->tx_nlp_sent++;
+		spin_unlock_irqrestore(&priv->tx_skb_lock, flags);
 	} else{
 		len = skb->len;
 
@@ -298,24 +356,35 @@ static void spi10m_tx_work_handler(struct work_struct *work)
 			transfer.tx_buf = priv->tx_buffer;
 			transfer.tx_dma = priv->tx_buffer_dma;
 
-			transfer.rx_buf = NULL;
-			transfer.rx_dma = 0;
+			transfer.rx_buf = priv->check_buffer;
+			transfer.rx_dma = priv->check_buffer_dma;
 
 			transfer.len = 2 * (spi10m_preamble_length + len);
-
+			transfer.speed_hz = priv->spi_speed;
 			spi_message_add_tail(&transfer, &message);
 
 			message.is_dma_mapped = 1;
 
-			transfer.speed_hz = priv->spi_speed;
-
 			spi_sync(priv->spi, &message);
+
+			if (priv->check_buffer) {
+				if (memcmp(priv->check_buffer +
+					   spi10m_preamble_length,
+					   priv->tx_buffer +
+					   spi10m_preamble_length,
+					   transfer.len -
+					   spi10m_preamble_length))
+					tx_ok = false;
+			}
 		}
 
 		spin_lock_irqsave(&priv->tx_skb_lock, flags);
 		priv->tx_skb = NULL;
 		priv->tx_packets++;
 		priv->tx_bytes += skb->len;
+		if (!tx_ok)
+			priv->tx_errors++;
+
 		spin_unlock_irqrestore(&priv->tx_skb_lock, flags);
 
 		dev_kfree_skb(skb);
@@ -411,10 +480,8 @@ static int spi10m_probe(struct spi_device *spi)
 	return 0;
 
 err_register:
-	dma_free_coherent(&spi->dev,
-			  dev->tx_buffer_size,
-			  dev->tx_buffer,
-			  dev->tx_buffer_dma);
+	spi10m_free_dma_buffer(dev, 0);
+	spi10m_free_dma_buffer(dev, 1);
 err_allocbuf:
 	free_netdev(dev->netdev);
 err_allocdev:
@@ -430,10 +497,8 @@ static int spi10m_remove(struct spi_device *spi)
 	unregister_netdev(dev->netdev);
 	free_netdev(dev->netdev);
 
-	dma_free_coherent(&spi->dev,
-			  dev->tx_buffer_size,
-			  dev->tx_buffer,
-			  dev->tx_buffer_dma);
+	spi10m_free_dma_buffer(dev, 0);
+	spi10m_free_dma_buffer(dev, 1);
 
 	return 0;
 }

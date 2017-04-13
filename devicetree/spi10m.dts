@@ -5,6 +5,17 @@
 	compatible = "brcm,bcm2708";
 
 	fragment@0 {
+		target = <&gpio>;
+		__overlay__ {
+			/* We only enable MOSI as output and MISO as input (for readback) */
+			spi0_pins: spi0_pins {
+				brcm,pins = <9 10>;
+				brcm,function = <4>;
+			};
+		};
+	};
+
+	fragment@1 {
 		target = <&spi0>;
 		__overlay__ {
 			/* Needed to avoid dtc warning */
@@ -12,6 +23,9 @@
 			#size-cells = <0>;
 
 			status = "okay";
+			
+			pinctrl-names = "default";
+			pinctrl-0 = <&spi0_pins>;
 
 			spidev@0{
 				status = "disabled";
@@ -22,17 +36,6 @@
 				reg = <0>;
 				spi-max-frequency = <20000000>;
 				status = "okay";
-			};
-		};
-	};
-
-	fragment@1 {
-		target = <&gpio>;
-		__overlay__ {
-			/* We only enable MOSI as output, leaving the other GPIO free */
-			spi0_pins: spi0_pins {
-                                brcm,pins = <10>;
-                                brcm,function = <4>; /* alt0 */
 			};
 		};
 	};
