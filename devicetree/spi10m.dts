@@ -7,10 +7,16 @@
 	fragment@0 {
 		target = <&gpio>;
 		__overlay__ {
-			/* We only enable MOSI as output and MISO as input (for readback) */
+			/* 
+			 * We only enable MOSI as output and MISO as input (for readback).
+			 * Enable pulldown on both pins to get a stable value during packets.
+			 * It seems the SPI peripheral tri-states MOSI when not doing a
+			 * transaction.
+			 */
 			spi0_pins: spi0_pins {
 				brcm,pins = <9 10>;
-				brcm,function = <4>;
+				brcm,function = <4 4>;
+				brcm,pull = <1 1>;
 			};
 		};
 	};
@@ -30,11 +36,23 @@
 			spidev@0{
 				status = "disabled";
 			};
+			
+			spidev@1{
+				status = "disabled";
+			};
+			
+			spidev@2{
+				status = "disabled";
+			};
 
 			eth1: spi10m@0{
 				compatible = "bertold,spi10m";
 				reg = <0>;
 				spi-max-frequency = <20000000>;
+				spi-frequency = <20000000>;
+				spi-readback;
+				preamble-len = <128>;
+				use-nlp;
 				status = "okay";
 			};
 		};

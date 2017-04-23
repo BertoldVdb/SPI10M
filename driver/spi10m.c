@@ -25,22 +25,6 @@
 #include <linux/crc32.h>
 #include <linux/if_vlan.h>
 
-/*
- * The normal preamble is 8 bytes long, but if you use a capacitor to drive
- * the line a longer preamble may be required to ensure no packets are lost.
- */
-static unsigned int spi10m_preamble_length = 8;
-module_param(spi10m_preamble_length, int, 0444);
-MODULE_PARM_DESC(spi10m_preamble_length, "Number of preamble bytes");
-
-/*
- * When this flag is set the driver will read back what it sent over the bus.
- * This can be used for monitoring if the transmitter is actually working.
- */
-static bool spi10m_spi_readback;
-module_param(spi10m_spi_readback, bool, 0444);
-MODULE_PARM_DESC(spi10m_spi_readback, "Use SPI readback");
-
 #define SPI10M_FOOTER_LEN (1 + 12)
 
 struct spi10m_dev {
@@ -50,23 +34,19 @@ struct spi10m_dev {
 	unsigned long tx_buffer_size;
 	unsigned long tx_buffer_max_packet;
 	uint16_t *tx_buffer;
-	dma_addr_t tx_buffer_dma;
 	struct mutex tx_buffer_mutex;
 
 	unsigned long check_buffer_size;
 	uint16_t *check_buffer;
-	dma_addr_t check_buffer_dma;
-
-	unsigned long spi_speed;
 
 	uint64_t tx_packets;
 	uint64_t tx_bytes;
 	uint64_t tx_errors;
 	uint64_t tx_nlp_sent;
 
-	struct hrtimer nlp_timer;
-	ktime_t nlp_period;
-	uint8_t nlp_byte[1];
+	struct hrtimer flp_timer;
+	ktime_t flp_period;
+	uint8_t *flp_buffer;
 
 	struct work_struct tx_work;
 
@@ -74,6 +54,13 @@ struct spi10m_dev {
 	spinlock_t tx_skb_lock;
 
 	uint16_t manchester_table[256];
+
+	bool closing;
+
+	unsigned int spi_clock;
+	unsigned int preamble_length;
+	bool spi_readback;
+	bool use_nlp;
 };
 
 static int spi10m_set_mac_address(struct net_device *dev, void *addr)
@@ -88,17 +75,17 @@ static int spi10m_set_mac_address(struct net_device *dev, void *addr)
 	return 0;
 }
 
-static enum hrtimer_restart spi10m_send_nlp(struct hrtimer *timer)
+static enum hrtimer_restart spi10m_send_flp(struct hrtimer *timer)
 {
 	struct spi10m_dev *priv =
-			container_of(timer, struct spi10m_dev, nlp_timer);
+			container_of(timer, struct spi10m_dev, flp_timer);
 	unsigned long flags;
 	bool need_link_pulse = false;
 
-	hrtimer_forward(&priv->nlp_timer, ktime_get(), priv->nlp_period);
+	hrtimer_forward(&priv->flp_timer, ktime_get(), priv->flp_period);
 
 	spin_lock_irqsave(&priv->tx_skb_lock, flags);
-	if (!priv->tx_skb)
+	if (!priv->tx_skb && !priv->closing)
 		need_link_pulse = true;
 	spin_unlock_irqrestore(&priv->tx_skb_lock, flags);
 
@@ -113,14 +100,19 @@ static netdev_tx_t spi10m_send_packet(struct sk_buff *skb,
 {
 	struct spi10m_dev *priv = netdev_priv(dev);
 	unsigned long flags;
+	bool closing;
 
 	netif_stop_queue(dev);
 
 	spin_lock_irqsave(&priv->tx_skb_lock, flags);
+	closing = priv->closing;
 	priv->tx_skb = skb;
 	spin_unlock_irqrestore(&priv->tx_skb_lock, flags);
 
-	schedule_work(&priv->tx_work);
+	if (closing)
+		dev_kfree_skb(skb);
+	else
+		schedule_work(&priv->tx_work);
 
 	return NETDEV_TX_OK;
 }
@@ -149,21 +141,21 @@ static struct rtnl_link_stats64 *spi10m_get_stats64
 static void spi10m_free_dma_buffer(struct spi10m_dev *dev, int buffer)
 {
 	if (buffer == 0 && dev->tx_buffer) {
-		dma_free_coherent(&dev->spi->dev,
-			  dev->tx_buffer_size,
-			  dev->tx_buffer,
-			  dev->tx_buffer_dma);
+		kfree(dev->tx_buffer);
+
 		dev->tx_buffer = NULL;
-		dev->tx_buffer_dma = 0;
 	}
 
 	if (buffer == 1 && dev->check_buffer) {
-		dma_free_coherent(&dev->spi->dev,
-			  dev->check_buffer_size,
-			  dev->check_buffer,
-			  dev->check_buffer_dma);
+		kfree(dev->check_buffer);
+
 		dev->check_buffer = NULL;
-		dev->check_buffer_dma = 0;
+	}
+
+	if (buffer == 2 && dev->flp_buffer) {
+		kfree(dev->flp_buffer);
+
+		dev->flp_buffer = NULL;
 	}
 }
 
@@ -173,10 +165,9 @@ static bool spi10m_alloc_ptx_buffer(struct spi10m_dev *dev,
 	bool ret = false;
 	unsigned int i;
 
-	unsigned long new_buffer_size = 2 * (spi10m_preamble_length +
+	unsigned long new_buffer_size = 2 * (dev->preamble_length +
 					     desired_max_packet +
 					     ETH_FCS_LEN + SPI10M_FOOTER_LEN);
-	dma_addr_t new_buffer_dma_tx;
 	uint16_t *new_buffer_tx;
 
 	if (dev->tx_buffer && (new_buffer_size == dev->tx_buffer_size))
@@ -184,42 +175,36 @@ static bool spi10m_alloc_ptx_buffer(struct spi10m_dev *dev,
 
 	mutex_lock(&dev->tx_buffer_mutex);
 
-	new_buffer_tx = dma_alloc_coherent(&dev->spi->dev,
-					   new_buffer_size,
-					   &new_buffer_dma_tx,
-					   GFP_KERNEL);
+	new_buffer_tx = kmalloc(new_buffer_size, GFP_KERNEL | GFP_DMA);
 
 	if (new_buffer_tx) {
 		/* Deallocate current buffer, if there is one */
 		spi10m_free_dma_buffer(dev, 0);
 
 		dev->tx_buffer = new_buffer_tx;
-		dev->tx_buffer_dma = new_buffer_dma_tx;
 		dev->tx_buffer_size = new_buffer_size;
 		dev->tx_buffer_max_packet = desired_max_packet;
 
 		/* Add the preamble and SFD */
-		for (i = 0; i < (spi10m_preamble_length - 1); i++)
+		for (i = 0; i < (dev->preamble_length - 1); i++)
 			new_buffer_tx[i] =
 				be16_to_cpu(dev->manchester_table[0x55]);
 
-		new_buffer_tx[spi10m_preamble_length - 1] =
+		new_buffer_tx[dev->preamble_length - 1] =
 				be16_to_cpu(dev->manchester_table[0xD5]);
 
 		ret = true;
 	}
 
-	if (spi10m_spi_readback) {
+	if (dev->spi_readback) {
 		spi10m_free_dma_buffer(dev, 1);
 
-		dev->check_buffer = dma_alloc_coherent(&dev->spi->dev,
-						       new_buffer_size,
-						       &dev->check_buffer_dma,
-						       GFP_KERNEL);
+		dev->check_buffer = kmalloc(new_buffer_size, GFP_KERNEL |
+							     GFP_DMA);
 		dev->check_buffer_size = new_buffer_size;
 
 		if (!dev->check_buffer)
-			dev_warn(&dev->spi->dev,
+			dev_warn(&dev->netdev->dev,
 				"Could not allocate verification buffer");
 	}
 
@@ -287,9 +272,12 @@ static void spi10m_tx_work_handler(struct work_struct *work)
 	/* If no SKB, send link pulse */
 	if (!skb) {
 		spi_message_init(&message);
-		transfer.tx_buf = priv->nlp_byte;
-		transfer.len = 1;
-		transfer.speed_hz = priv->spi_speed;
+		transfer.tx_buf = priv->flp_buffer;
+		if (priv->use_nlp)
+			transfer.len = 1;
+		else
+			transfer.len = 5009;
+		transfer.speed_hz = priv->spi_clock;
 		spi_message_add_tail(&transfer, &message);
 
 		spi_sync(priv->spi, &message);
@@ -305,7 +293,7 @@ static void spi10m_tx_work_handler(struct work_struct *work)
 
 		if (len <= priv->tx_buffer_max_packet) {
 			/* Skip preamble */
-			tx_packet += spi10m_preamble_length;
+			tx_packet += priv->preamble_length;
 
 			/* Manchester encoder packet */
 			for (i = 0; i < len; i++) {
@@ -320,10 +308,10 @@ static void spi10m_tx_work_handler(struct work_struct *work)
 			if (len < ETH_ZLEN) {
 				for (i = len; i < ETH_ZLEN; i++) {
 					tmp = priv->manchester_table[0];
-					tx_packet[len + i] = be16_to_cpu(tmp);
+					tx_packet[i] = be16_to_cpu(tmp);
 				}
 
-				/* TODO: This is very likely wrong... */
+				/* Extend CRC with padding */
 				crc_add = crc32_le_combine(crc_add, 0,
 							   ETH_ZLEN - len);
 
@@ -354,26 +342,20 @@ static void spi10m_tx_work_handler(struct work_struct *work)
 			/* Send it over SPI */
 			spi_message_init(&message);
 			transfer.tx_buf = priv->tx_buffer;
-			transfer.tx_dma = priv->tx_buffer_dma;
-
 			transfer.rx_buf = priv->check_buffer;
-			transfer.rx_dma = priv->check_buffer_dma;
 
-			transfer.len = 2 * (spi10m_preamble_length + len);
-			transfer.speed_hz = priv->spi_speed;
+			transfer.len = 2 * (priv->preamble_length + len);
+			transfer.speed_hz = priv->spi_clock;
 			spi_message_add_tail(&transfer, &message);
-
-			message.is_dma_mapped = 1;
 
 			spi_sync(priv->spi, &message);
 
 			if (priv->check_buffer) {
 				if (memcmp(priv->check_buffer +
-					   spi10m_preamble_length,
+					   2 * priv->preamble_length,
 					   priv->tx_buffer +
-					   spi10m_preamble_length,
-					   transfer.len -
-					   spi10m_preamble_length))
+					   2 * priv->preamble_length,
+					   2 * len))
 					tx_ok = false;
 			}
 		}
@@ -410,12 +392,39 @@ static uint16_t spi10m_calculate_manchester(uint8_t index)
 	return out;
 }
 
+static void spi10m_encode_flp(uint8_t *flp, uint16_t data)
+{
+	unsigned int i, j, bit;
+	unsigned int index = 0;
+
+	for (i = 0; i < 16; i++) {
+		if (data & (1 << i))
+			bit = 0x3;
+		else
+			bit = 0;
+
+		for (j = 0; j < 313; j++) {
+			if (j == 0)
+				flp[index] = 0x3;
+			else if (j == 156)
+				flp[index] = bit;
+			else
+				flp[index] = 0;
+
+			index++;
+		}
+	}
+
+	flp[index] = 0x3;
+}
+
 static int spi10m_probe(struct spi_device *spi)
 {
 	int ret = 0, i;
 
 	struct spi10m_dev *dev;
 	struct net_device *netdev;
+	struct device_node *node = spi->dev.of_node;
 
 	netdev = alloc_etherdev(sizeof(struct spi10m_dev));
 	if (!netdev) {
@@ -430,10 +439,18 @@ static int spi10m_probe(struct spi_device *spi)
 	spi_set_drvdata(spi, dev);
 	SET_NETDEV_DEV(netdev, &spi->dev);
 
-	dma_set_coherent_mask(&spi->dev, DMA_BIT_MASK(32));
+	/* Read devicetree properties */
+	dev->spi_readback = of_property_read_bool(node, "spi-readback");
 
-	if (spi10m_preamble_length <= 0)
-		spi10m_preamble_length = 1;
+	dev->use_nlp = of_property_read_bool(node, "use-nlp");
+
+	ret = of_property_read_u32(node, "preamble-len", &dev->preamble_length);
+	if (ret || dev->preamble_length <= 0)
+		dev->preamble_length = 8;
+
+	ret = of_property_read_u32(node, "spi-frequency", &dev->spi_clock);
+	if (ret || dev->spi_clock <= 100000)
+		dev->spi_clock = 20000000;
 
 	spin_lock_init(&dev->tx_skb_lock);
 	mutex_init(&dev->tx_buffer_mutex);
@@ -446,7 +463,7 @@ static int spi10m_probe(struct spi_device *spi)
 	if (ret) {
 		dev_err(&spi->dev, "TX Buffer allocation failed\n");
 
-		goto err_allocbuf;
+		goto err_dealloc;
 	}
 
 	/* This is a transmit only adapter so random is fine */
@@ -456,9 +473,17 @@ static int spi10m_probe(struct spi_device *spi)
 	netdev->netdev_ops = &spi10m_netdev_ops;
 	netdev->watchdog_timeo = HZ;
 
-	/* Setup SPI to 20MHz to create a 10MHz manchester signal */
-	dev->spi_speed = 20000000;
 	dev->spi = spi;
+
+	dev->flp_buffer = kmalloc(5009, GFP_KERNEL | GFP_DMA);
+	if (!dev->flp_buffer) {
+		ret = -ENOMEM;
+		dev_err(&spi->dev, "Could not allocate FLP buffer\n");
+
+		goto err_dealloc;
+	}
+
+	spi10m_encode_flp(dev->flp_buffer, 0x4070);
 
 	INIT_WORK(&dev->tx_work, spi10m_tx_work_handler);
 
@@ -466,23 +491,23 @@ static int spi10m_probe(struct spi_device *spi)
 	if (ret) {
 		dev_err(&spi->dev, "Netdev registration failed: %d\n", ret);
 
-		goto err_register;
+		goto err_dealloc;
 	}
 
-	dev->nlp_period = ktime_set(0, 16000000); /* 16ms */
-	hrtimer_init(&dev->nlp_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	dev->nlp_timer.function = spi10m_send_nlp;
-	dev->nlp_byte[0] = 0x3;
-	hrtimer_start(&dev->nlp_timer, dev->nlp_period, HRTIMER_MODE_REL);
+	hrtimer_init(&dev->flp_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	dev->flp_timer.function = spi10m_send_flp;
+	dev->flp_period = ktime_set(0, 16000000); /* 16ms */
+	hrtimer_start(&dev->flp_timer, dev->flp_period, HRTIMER_MODE_REL);
 
 	netif_start_queue(netdev);
 
 	return 0;
 
-err_register:
+err_dealloc:
 	spi10m_free_dma_buffer(dev, 0);
 	spi10m_free_dma_buffer(dev, 1);
-err_allocbuf:
+	spi10m_free_dma_buffer(dev, 2);
+
 	free_netdev(dev->netdev);
 err_allocdev:
 	return ret;
@@ -492,13 +517,17 @@ static int spi10m_remove(struct spi_device *spi)
 {
 	struct spi10m_dev *dev = spi_get_drvdata(spi);
 
-	hrtimer_cancel(&dev->nlp_timer);
+	dev->closing = true;
+	hrtimer_cancel(&dev->flp_timer);
+	cancel_work_sync(&dev->tx_work);
 
 	unregister_netdev(dev->netdev);
+
 	free_netdev(dev->netdev);
 
 	spi10m_free_dma_buffer(dev, 0);
 	spi10m_free_dma_buffer(dev, 1);
+	spi10m_free_dma_buffer(dev, 2);
 
 	return 0;
 }

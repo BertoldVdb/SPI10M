@@ -46,18 +46,17 @@ Now you need to update /boot/config.txt to activate the interface and configure 
 
 Now you should be able to load the module:
 ```sh
-~/$ sudo modprobe spi10m spi10m_preamble_length=128
+~/$ sudo modprobe spi10m
 ```
 The command should not give any error, and a new Ethernet interface should appear.
 
-The module parameter (spi10m_preamble_length) sets the preamble length to 128 bytes. Normal Ethernet uses only 8 bytes. Since we drive the line way out-of-spec using just a capacitor this may be needed to improve reliability. In my experience everything higher than 32 works with all cards. I put 128 to be extra safe. The overhead is quite small, unless you have many very short packets.
+The device-tree overlay sets the preamble length to 128. Normal Ethernet uses only 8 bytes. Since we drive the line way out-of-spec using just a capacitor this may be needed to improve reliability. In my experience everything higher than 32 works with all cards. I put 128 to be extra safe. The overhead is quite small, unless you have many very short packets.
 
 The line is not driven differentially. Do not use long cables since this may result in EMI problems (aim for less than 15cm). You may also get a significant amount of lost packets or just no packets at all due to our weak drive when your cable is too long. Use a more elaborate line driver circuit with a buffer and transformer if you want to use a long cable. With this you should reach the same distance as normal Ethernet and not need the longer preamble. If you need this it may be easier to just buy an Ethernet module that you can run of the SPI :).
 
 You can configure the system to load the module automatically on boot:
 ```sh
 ~/$ echo "spi10m" |sudo tee -a /etc/modules
-~/$ echo "options spi10m spi10m_preamble_length=128" |sudo tee /etc/modprobe.d/spi10m.conf
 ```
 
 After reboot the Ethernet interface should now be always there. If you complete the next section and plug the cable into another computer you should be able to send traffic (simplex, of course). The driver does not do auto-negotiation since it has no receive path. You may want to set the remote port to full duplex to reduce the risk of packet loss due to collisions. For example, on linux, you can do this with ethtool:
@@ -78,7 +77,7 @@ Connecting to a NIC:
 * TX+: Pin 3 (Usually orange/white striped wire)
 * TX-: Pin 6 (Usually orange wire)
 
-You need to know where the MOSI pin is on the board you are using. The following picture shows where to connect the wires on a Pi Zero:
+You need to know where the MOSI pin is on the board you are using. If you want TX error monitoring you must tie MOSI and MISO together. The following picture shows where to connect the wires on a Pi Zero:
 
 
 ![Pi Zero Wiring Example](wiring/pizero.png)
